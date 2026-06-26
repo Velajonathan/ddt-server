@@ -22,7 +22,7 @@ from pydantic import BaseModel
 # Config
 # ---------------------------------------------------------------------------
 
-GUILD_KEY   = os.environ.get("DDT_GUILD_KEY", "incognito_ddt_2024")  # set in Railway env vars
+GUILD_KEY   = os.environ.get("DDT_GUILD_KEY", "incognito2024")  # set in Railway env vars
 DATA_DIR    = Path(os.environ.get("DDT_DATA_DIR", "/data"))           # Railway persistent volume
 RECORDS_DIR = DATA_DIR / "records"
 SHOTS_DIR   = DATA_DIR / "screenshots"
