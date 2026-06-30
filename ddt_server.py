@@ -97,6 +97,7 @@ class PartyDPSPayload(BaseModel):
     room_code: str
     dps: int
     boss: str = ""
+    role: str = "DPS"
 
 class PartyLeavePayload(BaseModel):
     player: str
@@ -315,7 +316,7 @@ def party_join(
         raise HTTPException(status_code=404, detail="Room not found")
 
     PARTY_ROOMS[code]["members"][payload.player] = {
-        "dps": 0, "boss": "", "timestamp": time.time()
+        "dps": 0, "boss": "", "role": "DPS", "timestamp": time.time()
     }
     return {"status": "ok", "room_code": code, "members": list(PARTY_ROOMS[code]["members"].keys())}
 
@@ -336,6 +337,7 @@ def party_dps(
     PARTY_ROOMS[code]["members"][payload.player] = {
         "dps": payload.dps,
         "boss": payload.boss,
+        "role": payload.role,
         "timestamp": time.time()
     }
     return {"status": "ok"}
@@ -360,7 +362,7 @@ def party_live(
     return {
         "room_code": code,
         "members": [
-            {"player": p, "dps": d["dps"], "boss": d["boss"]}
+            {"player": p, "dps": d["dps"], "boss": d["boss"], "role": d.get("role", "DPS")}
             for p, d in sorted(members.items(), key=lambda x: x[1]["dps"], reverse=True)
         ]
     }
