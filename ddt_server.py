@@ -10,6 +10,9 @@ import json
 import shutil
 import hashlib
 import hmac
+import time
+import random
+import string
 from pathlib import Path
 from typing import Optional
 
@@ -50,6 +53,13 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# In-memory party sessions
+# { room_code: { "members": { player_name: { dps, boss, timestamp } }, "buffs": [...] } }
+# ---------------------------------------------------------------------------
+PARTY_ROOMS = {}
+PARTY_TIMEOUT = 10  # seconds before a member is considered offline
+
+# ---------------------------------------------------------------------------
 # Auth helper
 # ---------------------------------------------------------------------------
 
@@ -59,6 +69,17 @@ def verify_key(x_guild_key: Optional[str]) -> bool:
         return False
     return hmac.compare_digest(x_guild_key.strip(), GUILD_KEY)
 
+def clean_rooms():
+    """Remove stale members and empty rooms."""
+    now = time.time()
+    for code in list(PARTY_ROOMS.keys()):
+        members = PARTY_ROOMS[code]["members"]
+        stale = [p for p, d in members.items() if now - d.get("timestamp", 0) > PARTY_TIMEOUT]
+        for p in stale:
+            del members[p]
+        if not members:
+            del PARTY_ROOMS[code]
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -66,6 +87,26 @@ def verify_key(x_guild_key: Optional[str]) -> bool:
 class UploadPayload(BaseModel):
     player: str
     records: dict  # same format DDT already saves locally
+
+class PartyJoinPayload(BaseModel):
+    player: str
+    room_code: str
+
+class PartyDPSPayload(BaseModel):
+    player: str
+    room_code: str
+    dps: int
+    boss: str = ""
+
+class PartyLeavePayload(BaseModel):
+    player: str
+    room_code: str
+
+class PartyBuffPayload(BaseModel):
+    room_code: str
+    caster: str
+    buff_name: str
+    timestamp: float
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -173,11 +214,6 @@ def upload_screenshot(
     file: UploadFile = File(...),
     x_guild_key: Optional[str] = Header(None)
 ):
-    """
-    Upload a PB screenshot.
-    rank = 1, 2, or 3 (top run slot).
-    Overwrites previous screenshot for that player+boss+rank automatically.
-    """
     if not verify_key(x_guild_key):
         raise HTTPException(status_code=401, detail="Invalid guild key")
     if rank not in (1, 2, 3):
@@ -198,7 +234,6 @@ def upload_screenshot(
 
 @app.get("/screenshot/{player_name}/{boss_name}/{rank}")
 def get_screenshot(player_name: str, boss_name: str, rank: int):
-    """Serve a screenshot for display in DDT or the website."""
     safe_player = "".join(c for c in player_name if c.isalnum() or c in (" ", "_", "-")).strip()
     safe_boss   = "".join(c for c in boss_name   if c.isalnum() or c in (" ", "_", "-")).strip()
     filename    = f"{safe_player}_{safe_boss}_{rank}.png"
@@ -211,12 +246,11 @@ def get_screenshot(player_name: str, boss_name: str, rank: int):
 
 
 # ---------------------------------------------------------------------------
-# Admin: list all players (for future admin dashboard)
+# Admin: list all players
 # ---------------------------------------------------------------------------
 
 @app.get("/admin/players")
 def list_players(x_guild_key: Optional[str] = Header(None)):
-    """Return list of all registered players."""
     if not verify_key(x_guild_key):
         raise HTTPException(status_code=401, detail="Invalid guild key")
 
@@ -233,3 +267,164 @@ def list_players(x_guild_key: Optional[str] = Header(None)):
             continue
 
     return {"players": players, "count": len(players)}
+
+
+# ---------------------------------------------------------------------------
+# Party System
+# ---------------------------------------------------------------------------
+
+@app.post("/party/create")
+def party_create(
+    payload: PartyLeavePayload,
+    x_guild_key: Optional[str] = Header(None)
+):
+    """Create a new party room. Returns a 6-character room code."""
+    if not verify_key(x_guild_key):
+        raise HTTPException(status_code=401, detail="Invalid guild key")
+
+    clean_rooms()
+
+    # Generate unique 6-char room code
+    for _ in range(10):
+        code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        if code not in PARTY_ROOMS:
+            break
+
+    PARTY_ROOMS[code] = {
+        "members": {
+            payload.player: {"dps": 0, "boss": "", "timestamp": time.time()}
+        },
+        "buffs": []
+    }
+    return {"status": "ok", "room_code": code}
+
+
+@app.post("/party/join")
+def party_join(
+    payload: PartyJoinPayload,
+    x_guild_key: Optional[str] = Header(None)
+):
+    """Join an existing party room by code."""
+    if not verify_key(x_guild_key):
+        raise HTTPException(status_code=401, detail="Invalid guild key")
+
+    clean_rooms()
+
+    code = payload.room_code.upper().strip()
+    if code not in PARTY_ROOMS:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    PARTY_ROOMS[code]["members"][payload.player] = {
+        "dps": 0, "boss": "", "timestamp": time.time()
+    }
+    return {"status": "ok", "room_code": code, "members": list(PARTY_ROOMS[code]["members"].keys())}
+
+
+@app.post("/party/dps")
+def party_dps(
+    payload: PartyDPSPayload,
+    x_guild_key: Optional[str] = Header(None)
+):
+    """Push live DPS update for a player in a room."""
+    if not verify_key(x_guild_key):
+        raise HTTPException(status_code=401, detail="Invalid guild key")
+
+    code = payload.room_code.upper().strip()
+    if code not in PARTY_ROOMS:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    PARTY_ROOMS[code]["members"][payload.player] = {
+        "dps": payload.dps,
+        "boss": payload.boss,
+        "timestamp": time.time()
+    }
+    return {"status": "ok"}
+
+
+@app.get("/party/live/{room_code}")
+def party_live(
+    room_code: str,
+    x_guild_key: Optional[str] = Header(None)
+):
+    """Get live DPS for all members in a room."""
+    if not verify_key(x_guild_key):
+        raise HTTPException(status_code=401, detail="Invalid guild key")
+
+    clean_rooms()
+
+    code = room_code.upper().strip()
+    if code not in PARTY_ROOMS:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    members = PARTY_ROOMS[code]["members"]
+    return {
+        "room_code": code,
+        "members": [
+            {"player": p, "dps": d["dps"], "boss": d["boss"]}
+            for p, d in sorted(members.items(), key=lambda x: x[1]["dps"], reverse=True)
+        ]
+    }
+
+
+@app.post("/party/buff")
+def party_buff(
+    payload: PartyBuffPayload,
+    x_guild_key: Optional[str] = Header(None)
+):
+    """Report a buff received — used to relay buff back to the caster (support)."""
+    if not verify_key(x_guild_key):
+        raise HTTPException(status_code=401, detail="Invalid guild key")
+
+    code = payload.room_code.upper().strip()
+    if code not in PARTY_ROOMS:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    # Keep only last 50 buff events, drop old ones
+    buffs = PARTY_ROOMS[code]["buffs"]
+    buffs.append({
+        "caster": payload.caster,
+        "buff_name": payload.buff_name,
+        "timestamp": payload.timestamp
+    })
+    PARTY_ROOMS[code]["buffs"] = buffs[-50:]
+    return {"status": "ok"}
+
+
+@app.get("/party/buffs/{room_code}/{player_name}")
+def party_buffs(
+    room_code: str,
+    player_name: str,
+    since: float = 0,
+    x_guild_key: Optional[str] = Header(None)
+):
+    """Get buff events cast by a specific player since a given timestamp."""
+    if not verify_key(x_guild_key):
+        raise HTTPException(status_code=401, detail="Invalid guild key")
+
+    code = room_code.upper().strip()
+    if code not in PARTY_ROOMS:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    buffs = [
+        b for b in PARTY_ROOMS[code]["buffs"]
+        if b["caster"] == player_name and b["timestamp"] > since
+    ]
+    return {"buffs": buffs}
+
+
+@app.post("/party/leave")
+def party_leave(
+    payload: PartyLeavePayload,
+    x_guild_key: Optional[str] = Header(None)
+):
+    """Remove a player from a party room."""
+    if not verify_key(x_guild_key):
+        raise HTTPException(status_code=401, detail="Invalid guild key")
+
+    code = payload.room_code.upper().strip()
+    if code in PARTY_ROOMS:
+        PARTY_ROOMS[code]["members"].pop(payload.player, None)
+        if not PARTY_ROOMS[code]["members"]:
+            del PARTY_ROOMS[code]
+
+    return {"status": "ok"}
